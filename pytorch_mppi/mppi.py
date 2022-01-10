@@ -74,7 +74,8 @@ class MPPI():
                  rollout_samples=1,
                  rollout_var_cost=0,
                  rollout_var_discount=0.95,
-                 sample_null_action=False):
+                 sample_null_action=False,
+                 n_configs=1):
         """
         :param dynamics: function(state, action) -> next_state (K x nx) taking in batch state (K x nx) and action (K x nu)
         :param running_cost: function(state, action) -> cost (K x 1) taking in batch state and action (same as dynamics)
@@ -144,8 +145,14 @@ class MPPI():
         self.U = U_init
         self.u_init = u_init.to(self.d)
 
+        self.n_configs = n_configs
+        if self.K % self.n_configs != 0:
+          print("Number of environments must be multiple of configs")
+          assert(False)
+
         if self.U is None:
-            self.U = self.noise_dist.sample((self.T,))
+            self.U = self.noise_dist.sample((self.n_configs, self.T,))
+
 
         self.step_dependency = step_dependent_dynamics
         self.F = dynamics
@@ -180,8 +187,8 @@ class MPPI():
         :returns action: (nu) best action
         """
         # shift command 1 time step
-        self.U = torch.roll(self.U, -1, dims=0)
-        self.U[-1] = self.u_init
+        self.U = torch.roll(self.U, -1, dims=1)
+        self.U[:,-1] = self.u_init
 
         if not torch.is_tensor(state):
             state = torch.tensor(state)
@@ -189,19 +196,27 @@ class MPPI():
 
         cost_total = self._compute_total_cost_batch()
 
-        beta = torch.min(cost_total)
+        cost_total = torch.transpose(cost_total.reshape(-1, self.n_configs),
+                                     0,
+                                     1)
+
+        beta = torch.min(cost_total, keepdim=True, dim=1)[0]
         self.cost_total_non_zero = _ensure_non_zero(cost_total, beta, 1 / self.lambda_)
 
-        eta = torch.sum(self.cost_total_non_zero)
+        eta = torch.sum(self.cost_total_non_zero, keepdim=True, dim=1)
         self.omega = (1. / eta) * self.cost_total_non_zero
+        # self.noise -> KxTxnu
         for t in range(self.T):
-            self.U[t] += torch.sum(self.omega.view(-1, 1) * self.noise[:, t], dim=0)
-        action = self.U[:self.u_per_command]
+            self.U[:,t] += torch.sum(self.omega[:,:,None] * torch.transpose(self.noise[:, t].reshape(-1,self.n_configs,self.nu),0,1), dim=1)
+        action = self.U[:,:self.u_per_command]
         # reduce dimensionality if we only need the first command
         if self.u_per_command is 1:
-            action = action[0]
+            action = action[:,0]
 
-        return action
+        traj_beta = torch.min(beta)
+        traj_weights = _ensure_non_zero(cost_total, traj_beta, 1 / self.lambda_)
+        
+        return action, torch.sum(traj_weights, dim=1)
 
     def reset(self):
         """
@@ -231,6 +246,7 @@ class MPPI():
         for t in range(T):
             u = self.u_scale * perturbed_actions[:, t].repeat(self.M, 1, 1)
             state = self._dynamics(state, u, t)
+            
             c = self._running_cost(state, u)
             cost_samples += c
             if self.M > 1:
@@ -258,13 +274,14 @@ class MPPI():
         # resample noise each time we take an action
         self.noise = self.noise_dist.sample((self.K, self.T))
         # broadcast own control to noise over samples; now it's K x T x nu
-        self.perturbed_action = self.U + self.noise
+        repeated_U = self.U.repeat(self.K//self.n_configs,1,1)
+        self.perturbed_action = repeated_U + self.noise
         if self.sample_null_action:
             self.perturbed_action[self.K - 1] = 0
         # naively bound control
         self.perturbed_action = self._bound_action(self.perturbed_action)
         # bounded noise after bounding (some got cut off, so we don't penalize that in action cost)
-        self.noise = self.perturbed_action - self.U
+        self.noise = self.perturbed_action - repeated_U
         action_cost = self.lambda_ * self.noise @ self.noise_sigma_inv
 
         self.cost_total, self.states, self.actions = self._compute_rollout_costs(self.perturbed_action)
